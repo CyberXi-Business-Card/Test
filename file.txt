@@ -1,0 +1,30 @@
+# Run once, as Administrator. Keeps PM2 running all the time.
+$pm2Home = "C:\Livespace\Runtime\pm2"
+$pm2     = (Get-Command pm2.cmd).Source
+$script  = "C:\Livespace\Runtime\pm2-keepalive.ps1"
+
+# 1. Make PM2_HOME permanent for the whole server
+[Environment]::SetEnvironmentVariable("PM2_HOME", $pm2Home, "Machine")
+$env:PM2_HOME = $pm2Home
+
+# 2. Small check script: if PM2 is down or empty -> resurrect
+@"
+`$env:PM2_HOME = '$pm2Home'
+if (-not ((& '$pm2' jlist) -match '"pm_id"')) { & '$pm2' resurrect }
+"@ | Set-Content $script
+
+# 3. Run it as SYSTEM at startup and every 5 minutes (no login needed, no time limit)
+$action   = New-ScheduledTaskAction powershell.exe "-NoProfile -ExecutionPolicy Bypass -File $script"
+$triggers = @(
+    (New-ScheduledTaskTrigger -AtStartup),
+    (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
+)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
+Register-ScheduledTask "PM2-KeepAlive" -Action $action -Trigger $triggers -Settings $settings -User "NT AUTHORITY\SYSTEM" -RunLevel Highest -Force
+
+# 4. Save current apps, then let the task take over PM2 (few seconds downtime)
+& $pm2 save
+& $pm2 kill
+Start-ScheduledTask "PM2-KeepAlive"
+Start-Sleep 15
+& $pm2 list
