@@ -7,7 +7,7 @@
       powershell -ExecutionPolicy Bypass -File C:\Livespace\Runtime\scripts\pm2-startup.ps1 -Uninstall
 
   Install creates the task "PM2-Startup" that runs this script with -Run as SYSTEM,
-  at startup, in the background, with no time limit. Every 30 seconds it:
+  at startup, in the background, with no time limit. Every 15 seconds it:
     - runs "pm2 resurrect" if the PM2 daemon was closed/killed or the app list is empty
     - runs "pm2 restart <id>" for any app that is "stopped" or "errored"
 #>
@@ -21,7 +21,7 @@ $Pm2Js     = 'C:\Livespace\Runtime\npm-global\node_modules\pm2\bin\pm2'
 $LogFile   = 'C:\Livespace\Runtime\scripts\pm2-startup.log'
 $TmpDir    = 'C:\Livespace\Runtime\scripts\tmp'
 $TaskName  = 'PM2-Startup'
-$Interval  = 30      # seconds between checks
+$Interval  = 15      # seconds between checks
 
 $env:PM2_HOME = $Pm2Home
 $env:Path     = "C:\Program Files\nodejs;C:\Livespace\Runtime\npm-global;$env:Path"
@@ -56,8 +56,10 @@ function Get-Key($d, $k) { if ($d -and $d.ContainsKey($k)) { $d[$k] } }
 # Returns $null if PM2 is down, otherwise a list of apps (Id, Name, Status)
 function Get-Pm2Apps {
     $out = Invoke-Pm2 'jlist' 60
-    if (-not $out -or $out.IndexOf('[') -lt 0) { return $null }
-    $json = $out.Substring($out.IndexOf('['))
+    if (-not $out) { return $null }
+    # The JSON is the line that starts with "[{" or "[]" (skip "[PM2] Spawning daemon..." lines)
+    $json = $out -split "`r?`n" | Where-Object { $_ -match '^\s*\[\s*(\{|\])' } | Select-Object -Last 1
+    if (-not $json) { return $null }
     Add-Type -AssemblyName System.Web.Extensions
     $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
     $ser.MaxJsonLength = [int]::MaxValue
@@ -66,6 +68,17 @@ function Get-Pm2Apps {
         $apps += [pscustomobject]@{ Id = Get-Key $a 'pm_id'; Name = Get-Key $a 'name'; Status = Get-Key (Get-Key $a 'pm2_env') 'status' }
     }
     return ,$apps
+}
+
+# When the PM2 daemon is killed, its apps can keep running as orphans and block the ports
+# (EADDRINUSE), so resurrect fails. Kill those orphans before resurrecting.
+function Stop-OrphanApps {
+    Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+        Where-Object { $_.CommandLine -match 'pm2\\lib\\ProcessContainer' } |
+        ForEach-Object {
+            Write-Log ("Killing orphan PM2 app process PID {0}" -f $_.ProcessId)
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
 }
 
 # ------------------------------------------------------------------ RUN (background loop)
@@ -79,6 +92,8 @@ if ($Run) {
             $apps = Get-Pm2Apps
             if ($null -eq $apps -or $apps.Count -eq 0) {
                 Write-Log 'PM2 closed or app list empty -> pm2 resurrect'
+                if (-not (Test-Path "$Pm2Home\dump.pm2")) { Write-Log "ERROR: $Pm2Home\dump.pm2 not found - run 'pm2 save'." }
+                Stop-OrphanApps
                 $null = Invoke-Pm2 'resurrect' 180
                 Start-Sleep 10
                 $after = Get-Pm2Apps
@@ -125,14 +140,14 @@ foreach ($old in 'PM2-KeepAlive', 'PM2-Watchdog') {
 $apps = Get-Pm2Apps
 if ($apps -and $apps.Count -gt 0) { $null = Invoke-Pm2 'save --force'; Write-Host "Saved $($apps.Count) app(s) with pm2 save" }
 
-# Task: SYSTEM, at startup + relaunch check every 5 min, no time limit, single instance
+# Task: SYSTEM, at startup + relaunch check every 1 min, no time limit, single instance
 $self     = $MyInvocation.MyCommand.Path
 $action   = New-ScheduledTaskAction -Execute 'powershell.exe' `
             -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$self`" -Run" `
             -WorkingDirectory $WorkDir
 $triggers = @(
     (New-ScheduledTaskTrigger -AtStartup),
-    (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
+    (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1))   # relaunch watchdog within 1 min if it is closed
 )
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
             -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable `
