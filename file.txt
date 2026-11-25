@@ -1,30 +1,149 @@
-# Run once, as Administrator. Keeps PM2 running all the time.
-$pm2Home = "C:\Livespace\Runtime\pm2"
-$pm2     = (Get-Command pm2.cmd).Source
-$script  = "C:\Livespace\Runtime\pm2-keepalive.ps1"
+<#
+  pm2-startup.ps1  -  keeps PM2 and its apps running in the background all the time.
 
-# 1. Make PM2_HOME permanent for the whole server
-[Environment]::SetEnvironmentVariable("PM2_HOME", $pm2Home, "Machine")
-$env:PM2_HOME = $pm2Home
+  INSTALL  (one time, PowerShell as Administrator):
+      powershell -ExecutionPolicy Bypass -File C:\Livespace\Runtime\scripts\pm2-startup.ps1
+  UNINSTALL:
+      powershell -ExecutionPolicy Bypass -File C:\Livespace\Runtime\scripts\pm2-startup.ps1 -Uninstall
 
-# 2. Small check script: if PM2 is down or empty -> resurrect
-@"
-`$env:PM2_HOME = '$pm2Home'
-if (-not ((& '$pm2' jlist) -match '"pm_id"')) { & '$pm2' resurrect }
-"@ | Set-Content $script
+  Install creates the task "PM2-Startup" that runs this script with -Run as SYSTEM,
+  at startup, in the background, with no time limit. Every 30 seconds it:
+    - runs "pm2 resurrect" if the PM2 daemon was closed/killed or the app list is empty
+    - runs "pm2 restart <id>" for any app that is "stopped" or "errored"
+#>
+param([switch]$Run, [switch]$Uninstall)
 
-# 3. Run it as SYSTEM at startup and every 5 minutes (no login needed, no time limit)
-$action   = New-ScheduledTaskAction powershell.exe "-NoProfile -ExecutionPolicy Bypass -File $script"
+# ------------------------------------------------------------------ settings
+$Pm2Home   = 'C:\Livespace\Runtime\pm2'
+$WorkDir   = 'C:\Livespace\Runtime'
+$NodeExe   = 'C:\Program Files\nodejs\node.exe'
+$Pm2Js     = 'C:\Livespace\Runtime\npm-global\node_modules\pm2\bin\pm2'
+$LogFile   = 'C:\Livespace\Runtime\scripts\pm2-startup.log'
+$TmpDir    = 'C:\Livespace\Runtime\scripts\tmp'
+$TaskName  = 'PM2-Startup'
+$Interval  = 30      # seconds between checks
+
+$env:PM2_HOME = $Pm2Home
+$env:Path     = "C:\Program Files\nodejs;C:\Livespace\Runtime\npm-global;$env:Path"
+Set-Location $WorkDir
+
+# ------------------------------------------------------------------ helpers
+function Write-Log([string]$Msg) {
+    if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 5MB) { Move-Item $LogFile "$LogFile.old" -Force }
+    "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Msg | Add-Content -Path $LogFile -Encoding UTF8
+}
+
+# Run a pm2 command with a timeout; output goes to a file so a spawned daemon can't block us
+function Invoke-Pm2([string]$Arguments, [int]$TimeoutSec = 120) {
+    if (-not (Test-Path $TmpDir)) { New-Item -ItemType Directory $TmpDir -Force | Out-Null }
+    Get-ChildItem $TmpDir -Filter '*.out' | Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    $tmp = Join-Path $TmpDir ("{0}.out" -f [guid]::NewGuid().ToString('N'))
+    $p = Start-Process -FilePath $NodeExe -ArgumentList "`"$Pm2Js`" $Arguments" -WorkingDirectory $WorkDir `
+         -RedirectStandardOutput $tmp -WindowStyle Hidden -PassThru
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) { try { $p.Kill() } catch {} ; return $null }
+    $out = ''
+    try {
+        $fs = New-Object IO.FileStream($tmp, 'Open', 'Read', 'ReadWrite')
+        $sr = New-Object IO.StreamReader($fs); $out = $sr.ReadToEnd(); $sr.Dispose(); $fs.Dispose()
+    } catch { }
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $out
+}
+
+function Get-Key($d, $k) { if ($d -and $d.ContainsKey($k)) { $d[$k] } }
+
+# Returns $null if PM2 is down, otherwise a list of apps (Id, Name, Status)
+function Get-Pm2Apps {
+    $out = Invoke-Pm2 'jlist' 60
+    if (-not $out -or $out.IndexOf('[') -lt 0) { return $null }
+    $json = $out.Substring($out.IndexOf('['))
+    Add-Type -AssemblyName System.Web.Extensions
+    $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $ser.MaxJsonLength = [int]::MaxValue
+    $apps = @()
+    foreach ($a in $ser.DeserializeObject($json)) {
+        $apps += [pscustomobject]@{ Id = Get-Key $a 'pm_id'; Name = Get-Key $a 'name'; Status = Get-Key (Get-Key $a 'pm2_env') 'status' }
+    }
+    return ,$apps
+}
+
+# ------------------------------------------------------------------ RUN (background loop)
+if ($Run) {
+    $mutex = New-Object Threading.Mutex($false, 'Global\PM2-Startup')
+    try { if (-not $mutex.WaitOne(0)) { exit 0 } } catch { }   # already running -> exit
+    Write-Log 'Watchdog started.'
+
+    while ($true) {
+        try {
+            $apps = Get-Pm2Apps
+            if ($null -eq $apps -or $apps.Count -eq 0) {
+                Write-Log 'PM2 closed or app list empty -> pm2 resurrect'
+                $null = Invoke-Pm2 'resurrect' 180
+                Start-Sleep 10
+                $after = Get-Pm2Apps
+                if ($after -and $after.Count -gt 0) { Write-Log ("PM2 back: {0} app(s)." -f $after.Count) }
+                else { Write-Log 'WARNING: resurrect did not bring apps back (check dump.pm2 / run pm2 save).' }
+            }
+            else {
+                foreach ($app in $apps | Where-Object { $_.Status -in 'stopped', 'errored' }) {
+                    Write-Log ("App '{0}' (id {1}) is {2} -> pm2 restart" -f $app.Name, $app.Id, $app.Status)
+                    $null = Invoke-Pm2 "restart $($app.Id)" 60
+                }
+            }
+        } catch {
+            Write-Log "ERROR: $($_.Exception.Message)"
+        }
+        Start-Sleep -Seconds $Interval
+    }
+}
+
+# ------------------------------------------------------------------ INSTALL / UNINSTALL
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) { Write-Host 'Run this in PowerShell as Administrator.' -ForegroundColor Red; exit 1 }
+
+if ($Uninstall) {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.CommandLine -like '*pm2-startup.ps1*-Run*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    Write-Host "Task $TaskName removed. PM2 apps keep running." -ForegroundColor Green
+    exit 0
+}
+
+Write-Host "Installing $TaskName ..." -ForegroundColor Cyan
+
+# PM2_HOME for the whole server, so admins see the same pm2 list
+[Environment]::SetEnvironmentVariable('PM2_HOME', $Pm2Home, 'Machine')
+
+# Only one watchdog: disable older PM2 tasks
+foreach ($old in 'PM2-KeepAlive', 'PM2-Watchdog') {
+    if (Get-ScheduledTask $old -ErrorAction SilentlyContinue) { Disable-ScheduledTask $old | Out-Null; Write-Host "Disabled old task $old" }
+}
+
+# Save current apps (only if some are running, never save an empty list)
+$apps = Get-Pm2Apps
+if ($apps -and $apps.Count -gt 0) { $null = Invoke-Pm2 'save --force'; Write-Host "Saved $($apps.Count) app(s) with pm2 save" }
+
+# Task: SYSTEM, at startup + relaunch check every 5 min, no time limit, single instance
+$self     = $MyInvocation.MyCommand.Path
+$action   = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$self`" -Run" `
+            -WorkingDirectory $WorkDir
 $triggers = @(
     (New-ScheduledTaskTrigger -AtStartup),
     (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
 )
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
-Register-ScheduledTask "PM2-KeepAlive" -Action $action -Trigger $triggers -Settings $settings -User "NT AUTHORITY\SYSTEM" -RunLevel Highest -Force
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+            -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Settings $settings `
+    -User 'NT AUTHORITY\SYSTEM' -RunLevel Highest -Force | Out-Null
 
-# 4. Save current apps, then let the task take over PM2 (few seconds downtime)
-& $pm2 save
-& $pm2 kill
-Start-ScheduledTask "PM2-KeepAlive"
-Start-Sleep 15
-& $pm2 list
+Start-ScheduledTask $TaskName
+Write-Host 'Task created and started. Waiting 20 seconds...'
+Start-Sleep 20
+
+Get-ScheduledTask $TaskName | Select-Object TaskName, State | Format-Table -AutoSize
+& $NodeExe $Pm2Js list
+Write-Host "Done. Log: $LogFile" -ForegroundColor Green
